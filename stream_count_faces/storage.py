@@ -397,3 +397,405 @@ if __name__ == "__main__":
     print(f"Después de sincronizar: pending={stats['pending_events']}")
     
     print("Test completado")
+
+
+class FaceCache:
+    """
+    Cache de rostros para procesamiento offline.
+    
+    Cuando AWS Rekognition no está disponible (sin internet),
+    los rostros se almacenan localmente para su posterior
+    procesamiento cuando la conexión se restablezca.
+    
+    Características:
+    - Almacena imágenes de rostros como blobs SQLite
+    - Soporta procesamiento por lotes cuando hay conexión
+    - Evita duplicados mediante hash de imagen
+    - Limpieza automática de rostros procesados
+    
+    Ejemplo:
+        >>> cache = FaceCache("data/face_cache.db")
+        >>> cache.store_pending(face_bytes, event_timestamp)
+        >>> pending = cache.get_pending_faces(limit=10)
+        >>> for face in pending:
+        ...     # Procesar con AWS
+        ...     cache.mark_processed(face["id"], is_new=True)
+    """
+    
+    def __init__(self, db_path: str = "data/face_cache.db"):
+        """
+        Inicializa el cache de rostros.
+        
+        Args:
+            db_path: Ruta al archivo SQLite. Usa ':memory:' para test.
+        """
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._persistent_conn = None
+        
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        else:
+            self._persistent_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._persistent_conn.row_factory = sqlite3.Row
+        
+        self._init_database()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Context manager para conexiones."""
+        if self._persistent_conn is not None:
+            yield self._persistent_conn
+        else:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+    
+    def _init_database(self) -> None:
+        """Inicializa las tablas de la base de datos."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Tabla de rostros pendientes
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_faces (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        image_hash TEXT NOT NULL,
+                        image_data BLOB NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        retry_count INTEGER DEFAULT 0,
+                        processed INTEGER DEFAULT 0,
+                        is_new_passenger INTEGER DEFAULT NULL,
+                        face_id TEXT DEFAULT NULL,
+                        is_excluded INTEGER DEFAULT NULL,
+                        error_message TEXT DEFAULT NULL,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        processed_at TEXT DEFAULT NULL
+                    )
+                """)
+                
+                # Índices
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_pending_processed 
+                    ON pending_faces(processed)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_pending_hash 
+                    ON pending_faces(image_hash)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_pending_timestamp 
+                    ON pending_faces(timestamp)
+                """)
+                
+                conn.commit()
+                logger.info(f"FaceCache inicializado: {self.db_path}")
+    
+    def _compute_hash(self, image_data: bytes) -> str:
+        """Calcula hash de imagen para deduplicación."""
+        import hashlib
+        return hashlib.sha256(image_data).hexdigest()[:16]
+    
+    def store_pending(
+        self, 
+        image_data: bytes, 
+        timestamp: Optional[str] = None
+    ) -> Optional[int]:
+        """
+        Almacena un rostro pendiente de procesamiento.
+        
+        Args:
+            image_data: Imagen del rostro en bytes (JPEG)
+            timestamp: Timestamp del evento (opcional)
+            
+        Returns:
+            ID del registro, o None si ya existe (duplicado)
+        """
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+        
+        image_hash = self._compute_hash(image_data)
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Verificar si ya existe este rostro (por hash)
+                cursor.execute(
+                    "SELECT id FROM pending_faces WHERE image_hash = ? AND processed = 0",
+                    (image_hash,)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    logger.debug(f"Rostro duplicado ignorado: hash={image_hash[:8]}")
+                    return None
+                
+                # Insertar nuevo
+                cursor.execute(
+                    """
+                    INSERT INTO pending_faces (image_hash, image_data, timestamp)
+                    VALUES (?, ?, ?)
+                    """,
+                    (image_hash, image_data, timestamp)
+                )
+                conn.commit()
+                face_id = cursor.lastrowid
+                
+                logger.debug(f"Rostro pendiente almacenado: id={face_id}, hash={image_hash[:8]}")
+                return face_id
+    
+    def get_pending_faces(
+        self, 
+        limit: int = 50, 
+        max_retries: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtiene rostros pendientes de procesamiento.
+        
+        Args:
+            limit: Número máximo de rostros a retornar
+            max_retries: Máximo de reintentos antes de descartar
+            
+        Returns:
+            Lista de diccionarios con rostros pendientes
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, image_hash, image_data, timestamp, retry_count, created_at
+                    FROM pending_faces
+                    WHERE processed = 0 AND retry_count < ?
+                    ORDER BY timestamp ASC
+                    LIMIT ?
+                    """,
+                    (max_retries, limit)
+                )
+                
+                rows = cursor.fetchall()
+                faces = []
+                for row in rows:
+                    faces.append({
+                        "id": row["id"],
+                        "image_hash": row["image_hash"],
+                        "image_data": row["image_data"],
+                        "timestamp": row["timestamp"],
+                        "retry_count": row["retry_count"],
+                        "created_at": row["created_at"]
+                    })
+                
+                return faces
+    
+    def increment_retry(self, face_id: int) -> None:
+        """
+        Incrementa el contador de reintentos.
+        
+        Args:
+            face_id: ID del rostro
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE pending_faces SET retry_count = retry_count + 1 WHERE id = ?",
+                    (face_id,)
+                )
+                conn.commit()
+    
+    def mark_processed(
+        self,
+        face_id: int,
+        is_new: bool,
+        tracked_face_id: Optional[str] = None,
+        is_excluded: bool = False,
+        error_message: Optional[str] = None
+    ) -> None:
+        """
+        Marca un rostro como procesado.
+        
+        Args:
+            face_id: ID del registro en cache
+            is_new: True si es nuevo pasajero
+            tracked_face_id: ID asignado por FaceTracker
+            is_excluded: True si es personal autorizado
+            error_message: Mensaje de error si falló
+        """
+        processed_at = datetime.now().isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE pending_faces 
+                    SET processed = 1,
+                        is_new_passenger = ?,
+                        face_id = ?,
+                        is_excluded = ?,
+                        error_message = ?,
+                        processed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        1 if is_new else 0,
+                        tracked_face_id,
+                        1 if is_excluded else 0,
+                        error_message,
+                        processed_at,
+                        face_id
+                    )
+                )
+                conn.commit()
+                logger.debug(f"Rostro procesado: id={face_id}, is_new={is_new}, is_excluded={is_excluded}")
+    
+    def mark_failed(self, face_id: int, error_message: str) -> None:
+        """
+        Marca un rostro como fallido pero incrementa reintento.
+        
+        Args:
+            face_id: ID del registro
+            error_message: Descripción del error
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE pending_faces 
+                    SET retry_count = retry_count + 1,
+                        error_message = ?
+                    WHERE id = ?
+                    """,
+                    (error_message, face_id)
+                )
+                conn.commit()
+    
+    def get_pending_count(self) -> int:
+        """Obtiene el número de rostros pendientes."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM pending_faces WHERE processed = 0"
+                )
+                return cursor.fetchone()["count"]
+    
+    def cleanup_processed(self, days: int = 7) -> int:
+        """
+        Elimina rostros procesados antiguos.
+        
+        Args:
+            days: Días a mantener rostros procesados
+            
+        Returns:
+            Número de registros eliminados
+        """
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM pending_faces
+                    WHERE processed = 1 AND processed_at < ?
+                    """,
+                    (cutoff,)
+                )
+                conn.commit()
+                deleted = cursor.rowcount
+                
+                if deleted > 0:
+                    logger.info(f"Rostros procesados antiguos eliminados: {deleted}")
+                return deleted
+    
+    def cleanup_failed(self, max_retries: int = 3) -> int:
+        """
+        Elimina rostros que excedieron reintentos.
+        
+        Args:
+            max_retries: Máximo de reintentos permitidos
+            
+        Returns:
+            Número de registros eliminados
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM pending_faces
+                    WHERE processed = 0 AND retry_count >= ?
+                    """,
+                    (max_retries,)
+                )
+                conn.commit()
+                deleted = cursor.rowcount
+                
+                if deleted > 0:
+                    logger.warning(f"Rostros fallidos eliminados: {deleted}")
+                return deleted
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtiene estadísticas del cache."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("SELECT COUNT(*) as total FROM pending_faces")
+                total = cursor.fetchone()["total"]
+                
+                cursor.execute(
+                    "SELECT COUNT(*) as pending FROM pending_faces WHERE processed = 0"
+                )
+                pending = cursor.fetchone()["pending"]
+                
+                cursor.execute(
+                    "SELECT COUNT(*) as processed FROM pending_faces WHERE processed = 1"
+                )
+                processed = cursor.fetchone()["processed"]
+                
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) as new_passengers 
+                    FROM pending_faces 
+                    WHERE processed = 1 AND is_new_passenger = 1
+                    """
+                )
+                new_passengers = cursor.fetchone()["new_passengers"]
+                
+                cursor.execute(
+                    """
+                    SELECT SUM(LENGTH(image_data)) as total_bytes 
+                    FROM pending_faces 
+                    WHERE processed = 0
+                    """
+                )
+                row = cursor.fetchone()
+                pending_bytes = row["total_bytes"] if row["total_bytes"] else 0
+                
+                return {
+                    "total_faces": total,
+                    "pending_faces": pending,
+                    "processed_faces": processed,
+                    "new_passengers_found": new_passengers,
+                    "pending_storage_mb": round(pending_bytes / (1024 * 1024), 2),
+                    "db_path": self.db_path
+                }
+    
+    def clear_all(self) -> int:
+        """Elimina todos los registros."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM pending_faces")
+                conn.commit()
+                deleted = cursor.rowcount
+                logger.warning(f"FaceCache limpiado: {deleted} registros")
+                return deleted
+

@@ -88,6 +88,7 @@ class FaceTracker:
         similarity_threshold: float = 80.0,
         max_faces: int = 500,
         excluded_faces: Optional[List[Union[str, bytes, np.ndarray]]] = None,
+        offline_cache_path: Optional[str] = None,
         dry_run: bool = False,
         region: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
@@ -104,6 +105,9 @@ class FaceTracker:
             excluded_faces: Lista de rostros a excluir (personal autorizado).
                            Puede ser: rutas a imágenes, bytes, o arrays numpy.
                            Estos rostros NO cuentan como pasajeros.
+            offline_cache_path: Ruta para cache offline de rostros (SQLite).
+                               Si se provee, los rostros se almacenan cuando
+                               AWS no está disponible para procesamiento posterior.
             dry_run: Si True, no hace llamadas a AWS
             region: Región AWS (default: env o us-east-1)
             aws_access_key_id: AWS Access Key ID (opcional)
@@ -139,12 +143,21 @@ class FaceTracker:
         self._total_new_passengers = 0
         self._total_duplicates = 0
         self._total_excluded_detected = 0
+        self._total_offline_cached = 0
         self._last_cleanup = datetime.now()
         
         # Cliente AWS
         self._client = None
+        self._is_offline = False
         if not dry_run:
             self._init_client()
+        
+        # Cache offline (cuando AWS no está disponible)
+        self._offline_cache = None
+        if offline_cache_path:
+            from .storage import FaceCache
+            self._offline_cache = FaceCache(offline_cache_path)
+            logger.info(f"Offline cache habilitado: {offline_cache_path}")
         
         # Cargar rostros excluidos
         if excluded_faces:
@@ -448,12 +461,45 @@ class FaceTracker:
                     if error_code == 'InvalidParameterException':
                         continue
                     logger.warning(f"Error comparando con collage {collage_idx}: {e}")
-                    continue
+                    # Store face offline for later processing
+                    return self._handle_offline_storage(face_image, str(e))
                 except Exception as e:
+                    error_str = str(e)
+                    # Detect connection errors (no internet)
+                    if 'EndpointConnectionError' in error_str or 'ConnectionError' in error_str or 'Timeout' in error_str:
+                        logger.warning(f"Sin conexión a AWS, almacenando rostro offline: {e}")
+                        self._is_offline = True
+                        return self._handle_offline_storage(face_image, error_str)
                     logger.warning(f"Error en compare_faces: {e}")
                     continue
             
             # No se encontró en ningún collage
+            is_new, face_id = self._add_new_face(face_image)
+            return is_new, face_id, False
+    
+    def _handle_offline_storage(
+        self, 
+        face_image: bytes, 
+        error_message: str
+    ) -> Tuple[bool, Optional[str], bool]:
+        """
+        Almacena un rostro en cache offline cuando AWS no está disponible.
+        
+        Args:
+            face_image: Imagen del rostro
+            error_message: Mensaje de error de la conexión
+            
+        Returns:
+            Tupla indicando rostro pendiente (True, None, False) si se almacenó
+        """
+        if self._offline_cache:
+            cache_id = self._offline_cache.store_pending(face_image)
+            if cache_id:
+                self._total_offline_cached += 1
+                logger.debug(f"Rostro almacenado en cache offline: id={cache_id}")
+            return True, None, False  # Considerar como nuevo por ahora
+        else:
+            # Sin cache offline, considerar como nuevo (comportamiento anterior)
             is_new, face_id = self._add_new_face(face_image)
             return is_new, face_id, False
     
@@ -583,6 +629,135 @@ class FaceTracker:
             logger.info(f"Excluidos limpiados: {count}")
             return count
     
+    def process_offline_queue(self, limit: int = 50) -> Dict[str, int]:
+        """
+        Procesa rostros almacenados en cache offline.
+        
+        Debe llamarse periódicamente cuando la conexión se restablezca.
+        Procesa rostros pendientes y los clasifica como nuevos, duplicados
+        o excluidos.
+        
+        Args:
+            limit: Número máximo de rostros a procesar por llamada
+            
+        Returns:
+            Diccionario con estadísticas del procesamiento:
+            - processed: Total procesados
+            - new_passengers: Nuevos pasajeros encontrados
+            - duplicates: Duplicados detectados
+            - excluded: Personal autorizado detectado
+            - failed: Fallaron al procesar
+        """
+        if not self._offline_cache:
+            return {"processed": 0, "new_passengers": 0, "duplicates": 0, "excluded": 0, "failed": 0}
+        
+        pending = self._offline_cache.get_pending_faces(limit=limit)
+        if not pending:
+            return {"processed": 0, "new_passengers": 0, "duplicates": 0, "excluded": 0, "failed": 0}
+        
+        logger.info(f"Procesando {len(pending)} rostros del cache offline...")
+        
+        stats = {"processed": 0, "new_passengers": 0, "duplicates": 0, "excluded": 0, "failed": 0}
+        
+        for face_record in pending:
+            try:
+                face_image = face_record["image_data"]
+                cache_id = face_record["id"]
+                
+                # Intentar procesar con AWS
+                # Nota: usamos lógica similar a is_new_passenger pero sin recursión
+                is_new, face_id, is_excluded = self._process_cached_face(face_image)
+                
+                # Marcar como procesado
+                self._offline_cache.mark_processed(
+                    face_id=cache_id,
+                    is_new=is_new,
+                    tracked_face_id=face_id,
+                    is_excluded=is_excluded
+                )
+                
+                stats["processed"] += 1
+                if is_excluded:
+                    stats["excluded"] += 1
+                elif is_new:
+                    stats["new_passengers"] += 1
+                else:
+                    stats["duplicates"] += 1
+                    
+            except Exception as e:
+                logger.warning(f"Error procesando rostro offline {face_record['id']}: {e}")
+                self._offline_cache.mark_failed(face_record["id"], str(e))
+                stats["failed"] += 1
+        
+        logger.info(
+            f"Cache offline procesado: {stats['processed']} rostros, "
+            f"nuevos={stats['new_passengers']}, dup={stats['duplicates']}, "
+            f"excluidos={stats['excluded']}, fallidos={stats['failed']}"
+        )
+        
+        # Reset offline flag if successful processing
+        if stats["processed"] > 0 and stats["failed"] == 0:
+            self._is_offline = False
+        
+        return stats
+    
+    def _process_cached_face(self, face_image: bytes) -> Tuple[bool, Optional[str], bool]:
+        """
+        Procesa un rostro del cache (sin almacenar en cache si falla).
+        
+        Similar a is_new_passenger pero sin el fallback a offline storage.
+        """
+        # Mismo flujo que is_new_passenger pero más simple
+        if self._client is None and not self._init_client():
+            raise Exception("No se pudo inicializar cliente AWS")
+        
+        # Si no hay collages ni excluidos, es nuevo
+        if not self._collages and self._excluded_collage is None:
+            return self._add_new_face(face_image)[0], None, False
+        
+        # Verificar solo contra excluidos si no hay pasajeros
+        if not self._collages and self._excluded_collage is not None:
+            excluded_bytes = self._get_excluded_only_bytes()
+            if excluded_bytes and self._check_against_excluded(face_image, excluded_bytes):
+                return False, None, True
+            is_new, face_id = self._add_new_face(face_image)
+            return is_new, face_id, False
+        
+        # Verificar contra collages combinados
+        for collage_idx in range(len(self._collages)):
+            combined_bytes, excluded_width = self._build_combined_collage(collage_idx)
+            
+            self._total_api_calls += 1
+            response = self._client.compare_faces(
+                SourceImage={"Bytes": face_image},
+                TargetImage={"Bytes": combined_bytes},
+                SimilarityThreshold=self.similarity_threshold
+            )
+            
+            matches = response.get("FaceMatches", [])
+            if matches:
+                match = matches[0]
+                face_bbox = match.get("Face", {}).get("BoundingBox", {})
+                match_left = face_bbox.get("Left", 0)
+                match_x_pixels = int(match_left * (excluded_width + self._collages[collage_idx].shape[1]))
+                
+                if excluded_width > 0 and match_x_pixels < excluded_width:
+                    self._total_excluded_detected += 1
+                    return False, None, True
+                else:
+                    self._total_duplicates += 1
+                    return False, self._find_face_id_by_collage(collage_idx), False
+        
+        # No coincide con nadie, es nuevo
+        is_new, face_id = self._add_new_face(face_image)
+        return is_new, face_id, False
+    
+    def get_offline_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """Obtiene estadísticas del cache offline si está habilitado."""
+        if self._offline_cache:
+            return self._offline_cache.get_stats()
+        return None
+    
     def get_stats(self) -> Dict[str, Any]:
         """Obtiene estadísticas del rastreador."""
         with self._lock:
@@ -591,7 +766,7 @@ class FaceTracker:
                 if not f.is_expired(self.ttl_minutes)
             )
             
-            return {
+            stats = {
                 "tracked_faces": len(self._tracked_faces),
                 "active_faces": active_faces,
                 "collages": len(self._collages),
@@ -602,6 +777,8 @@ class FaceTracker:
                 "new_passengers": self._total_new_passengers,
                 "duplicates": self._total_duplicates,
                 "excluded_detected": self._total_excluded_detected,
+                "offline_cached": self._total_offline_cached,
+                "is_offline": self._is_offline,
                 "duplicate_rate": (
                     self._total_duplicates / self._total_comparisons * 100
                     if self._total_comparisons > 0 else 0
@@ -614,6 +791,12 @@ class FaceTracker:
                 "max_faces": self.max_faces,
                 "dry_run": self.dry_run
             }
+            
+            # Agregar stats del cache offline si existe
+            if self._offline_cache:
+                stats["offline_cache"] = self._offline_cache.get_stats()
+            
+            return stats
 
 
 def extract_face_image(
