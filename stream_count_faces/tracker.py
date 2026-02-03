@@ -4,8 +4,10 @@ tracker.py - Rastreo de rostros para deduplicación de pasajeros usando collage
 Proporciona la clase FaceTracker para evitar contar la misma persona
 múltiples veces dentro de un período de tiempo configurable.
 
-Usa un COLLAGE de rostros para hacer una única llamada a compare_faces
-en lugar de comparar contra cada rostro individualmente.
+Características:
+- Usa COLLAGE de rostros para hacer una única llamada a compare_faces
+- Soporta EXCLUSIÓN de personal autorizado (no cuentan como pasajeros)
+- TTL configurable para "olvidar" pasajeros después de cierto tiempo
 """
 
 import os
@@ -15,8 +17,9 @@ import logging
 import threading
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Union
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Load environment variables from .env file if available
 try:
@@ -50,28 +53,27 @@ class TrackedFace:
 
 class FaceTracker:
     """
-    Rastrea rostros usando un COLLAGE para evitar conteos duplicados.
+    Rastrea rostros usando COLLAGES para evitar conteos duplicados.
     
-    En lugar de comparar contra cada rostro individualmente, mantiene
-    un collage (imagen horizontal) con todos los rostros detectados.
-    Una única llamada a compare_faces compara el nuevo rostro contra
-    todos los rostros del collage simultáneamente.
+    Características:
+    - Mantiene collages de pasajeros detectados (con TTL)
+    - Soporta EXCLUSIÓN de personal autorizado (sin TTL)
+    - Una única llamada API compara contra AMBOS collages
     
-    Ventajas del enfoque de collage:
-    - Una sola llamada API por rostro nuevo (vs N llamadas)
-    - Más eficiente en costos de AWS
-    - Mismo resultado de deduplicación
-    
-    Atributos:
-        ttl_minutes: Tiempo en minutos antes de expirar un registro (default: 180 = 3 horas)
-        similarity_threshold: Umbral de similitud para considerar coincidencia (default: 80%)
-        max_faces: Número máximo de rostros en collage
-        
     Ejemplo:
-        >>> tracker = FaceTracker(ttl_minutes=180)
-        >>> is_new, face_id = tracker.is_new_passenger(face_image_bytes)
-        >>> if is_new:
-        ...     print("Nuevo pasajero detectado")
+        >>> # Fotos del personal (operador, conductor)
+        >>> staff_photos = ["conductor.jpg", "operador.jpg"]
+        >>> 
+        >>> tracker = FaceTracker(
+        ...     ttl_minutes=180,
+        ...     excluded_faces=staff_photos
+        ... )
+        >>> 
+        >>> is_new, face_id, is_excluded = tracker.is_new_passenger(face_bytes)
+        >>> if is_excluded:
+        ...     print("Personal autorizado detectado")
+        >>> elif is_new:
+        ...     print("Nuevo pasajero")
     """
     
     # Tamaño estándar para cada rostro en el collage
@@ -85,6 +87,7 @@ class FaceTracker:
         ttl_minutes: int = 180,  # 3 horas por defecto
         similarity_threshold: float = 80.0,
         max_faces: int = 500,
+        excluded_faces: Optional[List[Union[str, bytes, np.ndarray]]] = None,
         dry_run: bool = False,
         region: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
@@ -98,6 +101,9 @@ class FaceTracker:
             ttl_minutes: Minutos antes de expirar un registro (default: 180 = 3 horas)
             similarity_threshold: Umbral de similitud % (default: 80.0)
             max_faces: Máximo de rostros en cache (default: 500)
+            excluded_faces: Lista de rostros a excluir (personal autorizado).
+                           Puede ser: rutas a imágenes, bytes, o arrays numpy.
+                           Estos rostros NO cuentan como pasajeros.
             dry_run: Si True, no hace llamadas a AWS
             region: Región AWS (default: env o us-east-1)
             aws_access_key_id: AWS Access Key ID (opcional)
@@ -115,9 +121,13 @@ class FaceTracker:
         self._aws_secret_access_key = aws_secret_access_key or os.getenv("AWS_SECRET_ACCESS_KEY")
         self._aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN")
         
-        # Collages de rostros (lista de imágenes numpy)
+        # Collages de PASAJEROS (con TTL)
         self._collages: List[np.ndarray] = []
-        self._current_collage_faces = 0  # Rostros en el collage actual
+        self._current_collage_faces = 0
+        
+        # Collage de PERSONAL EXCLUIDO (sin TTL, permanente)
+        self._excluded_collage: Optional[np.ndarray] = None
+        self._excluded_faces_count = 0
         
         # Metadatos de rostros rastreados
         self._tracked_faces: Dict[str, TrackedFace] = {}
@@ -128,6 +138,7 @@ class FaceTracker:
         self._total_api_calls = 0
         self._total_new_passengers = 0
         self._total_duplicates = 0
+        self._total_excluded_detected = 0
         self._last_cleanup = datetime.now()
         
         # Cliente AWS
@@ -135,10 +146,14 @@ class FaceTracker:
         if not dry_run:
             self._init_client()
         
+        # Cargar rostros excluidos
+        if excluded_faces:
+            self._load_excluded_faces(excluded_faces)
+        
         logger.info(
-            f"FaceTracker (collage mode) inicializado: ttl={ttl_minutes}min, "
+            f"FaceTracker inicializado: ttl={ttl_minutes}min, "
             f"similarity={similarity_threshold}%, max_faces={max_faces}, "
-            f"dry_run={dry_run}"
+            f"excluded_faces={self._excluded_faces_count}, dry_run={dry_run}"
         )
     
     def _init_client(self) -> bool:
@@ -162,41 +177,117 @@ class FaceTracker:
             logger.error(f"Error inicializando cliente tracking: {e}")
             return False
     
-    def _resize_face(self, face_img: np.ndarray) -> np.ndarray:
+    def _load_excluded_faces(self, faces: List[Union[str, bytes, np.ndarray]]) -> int:
         """
-        Redimensiona un rostro al tamaño estándar del collage.
+        Carga rostros excluidos (personal autorizado).
+        
+        Args:
+            faces: Lista de rostros (rutas, bytes o arrays numpy)
+            
+        Returns:
+            Número de rostros cargados exitosamente
+        """
+        loaded = 0
+        for face in faces:
+            try:
+                face_img = self._load_face_image(face)
+                if face_img is not None:
+                    self._add_to_excluded_collage(face_img)
+                    loaded += 1
+                    logger.debug(f"Rostro excluido cargado: {face if isinstance(face, str) else 'bytes/array'}")
+            except Exception as e:
+                logger.warning(f"Error cargando rostro excluido: {e}")
+        
+        self._excluded_faces_count = loaded
+        logger.info(f"Rostros excluidos cargados: {loaded}")
+        return loaded
+    
+    def _load_face_image(self, source: Union[str, bytes, np.ndarray]) -> Optional[np.ndarray]:
+        """
+        Carga una imagen de rostro desde diferentes fuentes.
+        
+        Args:
+            source: Ruta a imagen, bytes, o array numpy
+            
+        Returns:
+            Imagen BGR numpy array, o None si falla
+        """
+        if isinstance(source, np.ndarray):
+            return source
+        
+        if isinstance(source, bytes):
+            nparr = np.frombuffer(source, np.uint8)
+            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if isinstance(source, str):
+            path = Path(source)
+            if path.exists():
+                return cv2.imread(str(path))
+            else:
+                logger.warning(f"Archivo no encontrado: {source}")
+                return None
+        
+        return None
+    
+    def _add_to_excluded_collage(self, face_img: np.ndarray) -> None:
+        """
+        Agrega un rostro al collage de excluidos.
         
         Args:
             face_img: Imagen del rostro (BGR)
+        """
+        resized = self._resize_face(face_img)
+        
+        if self._excluded_collage is None:
+            self._excluded_collage = resized
+        else:
+            # Asegurar misma altura
+            if resized.shape[0] != self._excluded_collage.shape[0]:
+                resized = cv2.resize(resized, (self.FACE_SIZE[0], self._excluded_collage.shape[0]))
+            self._excluded_collage = np.hstack([self._excluded_collage, resized])
+    
+    def add_excluded_face(self, face: Union[str, bytes, np.ndarray]) -> bool:
+        """
+        Agrega un nuevo rostro a la lista de excluidos en tiempo de ejecución.
+        
+        Args:
+            face: Ruta a imagen, bytes, o array numpy
             
         Returns:
-            Imagen redimensionada
+            True si se agregó exitosamente
+        """
+        with self._lock:
+            face_img = self._load_face_image(face)
+            if face_img is not None:
+                self._add_to_excluded_collage(face_img)
+                self._excluded_faces_count += 1
+                logger.info(f"Rostro excluido agregado. Total: {self._excluded_faces_count}")
+                return True
+            return False
+    
+    def _resize_face(self, face_img: np.ndarray) -> np.ndarray:
+        """
+        Redimensiona un rostro al tamaño estándar del collage.
         """
         return cv2.resize(face_img, self.FACE_SIZE, interpolation=cv2.INTER_AREA)
     
     def _add_face_to_collage(self, face_img: np.ndarray) -> int:
         """
-        Agrega un rostro al collage actual.
+        Agrega un rostro al collage de pasajeros.
         
-        Args:
-            face_img: Imagen del rostro (BGR)
-            
         Returns:
             Índice del collage donde se agregó
         """
         resized = self._resize_face(face_img)
         
-        # Crear nuevo collage si es necesario
         if not self._collages or self._current_collage_faces >= self.MAX_FACES_PER_COLLAGE:
             self._collages.append(resized)
             self._current_collage_faces = 1
             return len(self._collages) - 1
         
-        # Agregar al collage actual (horizontalmente)
         current_idx = len(self._collages) - 1
         current_collage = self._collages[current_idx]
         
-        # Asegurar misma altura
         if resized.shape[0] != current_collage.shape[0]:
             resized = cv2.resize(resized, (self.FACE_SIZE[0], current_collage.shape[0]))
         
@@ -205,20 +296,56 @@ class FaceTracker:
         
         return current_idx
     
-    def _get_collage_bytes(self, collage_idx: int) -> bytes:
+    def _build_combined_collage(self, passenger_collage_idx: int) -> Tuple[bytes, int]:
         """
-        Obtiene el collage como bytes JPEG.
+        Construye un collage combinado: excluidos + pasajeros.
+        
+        El orden es importante: primero excluidos, luego pasajeros.
+        Esto permite determinar si la coincidencia es con personal excluido
+        basándose en la posición del rostro coincidente.
         
         Args:
-            collage_idx: Índice del collage
+            passenger_collage_idx: Índice del collage de pasajeros
             
         Returns:
-            Collage codificado como JPEG bytes
+            Tupla (collage_bytes, excluded_width):
+                - collage_bytes: Collage combinado en JPEG bytes
+                - excluded_width: Ancho del collage de excluidos (para determinar coincidencias)
         """
-        if collage_idx >= len(self._collages):
-            return b""
+        excluded_width = 0
         
-        _, buffer = cv2.imencode('.jpg', self._collages[collage_idx], [cv2.IMWRITE_JPEG_QUALITY, 85])
+        passenger_collage = self._collages[passenger_collage_idx]
+        
+        if self._excluded_collage is not None:
+            excluded_width = self._excluded_collage.shape[1]
+            
+            # Asegurar misma altura
+            excluded = self._excluded_collage
+            if excluded.shape[0] != passenger_collage.shape[0]:
+                scale = passenger_collage.shape[0] / excluded.shape[0]
+                new_width = int(excluded.shape[1] * scale)
+                excluded = cv2.resize(excluded, (new_width, passenger_collage.shape[0]))
+                excluded_width = new_width
+            
+            # Combinar: excluidos a la izquierda, pasajeros a la derecha
+            combined = np.hstack([excluded, passenger_collage])
+        else:
+            combined = passenger_collage
+        
+        _, buffer = cv2.imencode('.jpg', combined, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return buffer.tobytes(), excluded_width
+    
+    def _get_excluded_only_bytes(self) -> Optional[bytes]:
+        """
+        Obtiene el collage de excluidos como bytes JPEG.
+        
+        Returns:
+            Bytes JPEG del collage de excluidos, o None si no hay
+        """
+        if self._excluded_collage is None:
+            return None
+        
+        _, buffer = cv2.imencode('.jpg', self._excluded_collage, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return buffer.tobytes()
     
     def is_new_passenger(
@@ -226,14 +353,15 @@ class FaceTracker:
         face_image: bytes,
         frame: Optional[np.ndarray] = None,
         bounding_box: Optional[Dict[str, float]] = None
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str], bool]:
         """
         Determina si un rostro corresponde a un nuevo pasajero.
         
-        Compara el rostro contra TODOS los collages existentes con
-        una única llamada compare_faces por collage. Si encuentra
-        coincidencia, retorna False. Si no hay coincidencia en
-        ningún collage, agrega el rostro y retorna True.
+        Compara el rostro contra:
+        1. Collage de excluidos (personal autorizado)
+        2. Collages de pasajeros anteriores
+        
+        Todo en UNA SOLA llamada API (collage combinado).
         
         Args:
             face_image: Imagen del rostro en bytes (JPEG)
@@ -241,13 +369,13 @@ class FaceTracker:
             bounding_box: Bounding box del rostro (opcional)
             
         Returns:
-            Tupla (is_new, face_id):
+            Tupla (is_new, face_id, is_excluded):
                 - is_new: True si es un nuevo pasajero
-                - face_id: ID del rostro (nuevo o existente)
+                - face_id: ID del rostro (o None si es excluido)
+                - is_excluded: True si es personal autorizado (no cuenta)
         """
         self._total_comparisons += 1
         
-        # Limpiar cache periódicamente
         self._maybe_cleanup()
         
         if self.dry_run:
@@ -255,47 +383,69 @@ class FaceTracker:
         
         if self._client is None:
             if not self._init_client():
-                return self._add_new_face(face_image)
+                is_new, face_id = self._add_new_face(face_image)
+                return is_new, face_id, False
         
         with self._lock:
-            # Si no hay collages, es definitivamente nuevo
-            if not self._collages:
-                return self._add_new_face(face_image)
+            # Caso 1: Solo hay excluidos, no hay pasajeros previos
+            if not self._collages and self._excluded_collage is not None:
+                excluded_bytes = self._get_excluded_only_bytes()
+                if excluded_bytes:
+                    is_excluded = self._check_against_excluded(face_image, excluded_bytes)
+                    if is_excluded:
+                        self._total_excluded_detected += 1
+                        logger.debug("Personal autorizado detectado (solo excluidos)")
+                        return False, None, True
+                
+                # No es excluido, es nuevo pasajero
+                is_new, face_id = self._add_new_face(face_image)
+                return is_new, face_id, False
             
-            # Comparar contra cada collage (una llamada API por collage)
-            for collage_idx, collage in enumerate(self._collages):
+            # Caso 2: No hay collages de pasajeros ni excluidos
+            if not self._collages:
+                is_new, face_id = self._add_new_face(face_image)
+                return is_new, face_id, False
+            
+            # Caso 3: Hay collages de pasajeros (y posiblemente excluidos)
+            for collage_idx in range(len(self._collages)):
                 try:
-                    collage_bytes = self._get_collage_bytes(collage_idx)
-                    if not collage_bytes:
-                        continue
+                    # Construir collage combinado
+                    combined_bytes, excluded_width = self._build_combined_collage(collage_idx)
                     
                     self._total_api_calls += 1
                     
                     response = self._client.compare_faces(
                         SourceImage={"Bytes": face_image},
-                        TargetImage={"Bytes": collage_bytes},
+                        TargetImage={"Bytes": combined_bytes},
                         SimilarityThreshold=self.similarity_threshold
                     )
                     
                     matches = response.get("FaceMatches", [])
                     if matches:
-                        # Encontramos coincidencia
-                        similarity = matches[0].get("Similarity", 0)
-                        self._total_duplicates += 1
+                        # Determinar si la coincidencia es con excluido o pasajero
+                        match = matches[0]
+                        similarity = match.get("Similarity", 0)
+                        face_bbox = match.get("Face", {}).get("BoundingBox", {})
                         
-                        # Buscar el face_id correspondiente (aproximado por posición)
-                        matched_face_id = self._find_face_id_by_collage(collage_idx)
+                        # La posición X del rostro coincidente determina si es excluido
+                        match_left = face_bbox.get("Left", 0)
+                        match_x_pixels = int(match_left * (excluded_width + self._collages[collage_idx].shape[1]))
                         
-                        logger.debug(
-                            f"Pasajero duplicado: collage={collage_idx}, "
-                            f"similarity={similarity:.1f}%, face_id={matched_face_id}"
-                        )
-                        return False, matched_face_id
+                        if excluded_width > 0 and match_x_pixels < excluded_width:
+                            # Coincidencia con personal excluido
+                            self._total_excluded_detected += 1
+                            logger.debug(f"Personal autorizado detectado: similarity={similarity:.1f}%")
+                            return False, None, True
+                        else:
+                            # Coincidencia con pasajero anterior
+                            self._total_duplicates += 1
+                            matched_face_id = self._find_face_id_by_collage(collage_idx)
+                            logger.debug(f"Pasajero duplicado: similarity={similarity:.1f}%")
+                            return False, matched_face_id, False
                         
                 except ClientError as e:
                     error_code = e.response['Error']['Code']
                     if error_code == 'InvalidParameterException':
-                        # No se detectó rostro, continuar con siguiente collage
                         continue
                     logger.warning(f"Error comparando con collage {collage_idx}: {e}")
                     continue
@@ -303,49 +453,54 @@ class FaceTracker:
                     logger.warning(f"Error en compare_faces: {e}")
                     continue
             
-            # No se encontró en ningún collage, es nuevo
-            return self._add_new_face(face_image)
+            # No se encontró en ningún collage
+            is_new, face_id = self._add_new_face(face_image)
+            return is_new, face_id, False
     
-    def _find_face_id_by_collage(self, collage_idx: int) -> Optional[str]:
+    def _check_against_excluded(self, face_image: bytes, excluded_bytes: bytes) -> bool:
         """
-        Encuentra un face_id asociado a un collage.
+        Verifica si un rostro coincide con algún excluido.
         
         Args:
-            collage_idx: Índice del collage
+            face_image: Rostro a verificar
+            excluded_bytes: Collage de excluidos
             
         Returns:
-            face_id si se encuentra, None si no
+            True si coincide con algún excluido
         """
+        try:
+            self._total_api_calls += 1
+            response = self._client.compare_faces(
+                SourceImage={"Bytes": face_image},
+                TargetImage={"Bytes": excluded_bytes},
+                SimilarityThreshold=self.similarity_threshold
+            )
+            return len(response.get("FaceMatches", [])) > 0
+        except Exception as e:
+            logger.warning(f"Error verificando excluidos: {e}")
+            return False
+    
+    def _find_face_id_by_collage(self, collage_idx: int) -> Optional[str]:
+        """Encuentra un face_id asociado a un collage."""
         for face_id, tracked in self._tracked_faces.items():
             if tracked.position_in_collage == collage_idx:
                 return face_id
         return None
     
     def _add_new_face(self, face_image: bytes) -> Tuple[bool, str]:
-        """
-        Agrega un nuevo rostro al sistema.
-        
-        Args:
-            face_image: Imagen del rostro en bytes
-            
-        Returns:
-            Tupla (True, face_id) indicando nuevo pasajero
-        """
-        # Verificar límite de cache
+        """Agrega un nuevo rostro al sistema."""
         if len(self._tracked_faces) >= self.max_faces:
             self._evict_oldest()
         
         face_id = str(uuid.uuid4())[:8]
         now = datetime.now()
-        collage_idx = -1  # Por defecto, sin collage
+        collage_idx = -1
         
-        # Decodificar imagen (solo si no estamos en dry_run o si es imagen válida)
         if not self.dry_run:
             nparr = np.frombuffer(face_image, np.uint8)
             face_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if face_img is not None:
-                # Agregar al collage
                 collage_idx = self._add_face_to_collage(face_img)
             else:
                 logger.warning("No se pudo decodificar imagen del rostro")
@@ -363,32 +518,20 @@ class FaceTracker:
         logger.debug(f"Nuevo pasajero: {face_id}, collage={collage_idx}")
         return True, face_id
     
-    def _simulate_comparison(self, face_image: bytes) -> Tuple[bool, Optional[str]]:
-        """
-        Simula comparación para modo dry_run.
-        
-        En dry_run, siempre considera los rostros como nuevos
-        pero los rastrea correctamente.
-        """
-        return self._add_new_face(face_image)
+    def _simulate_comparison(self, face_image: bytes) -> Tuple[bool, Optional[str], bool]:
+        """Simula comparación para modo dry_run."""
+        is_new, face_id = self._add_new_face(face_image)
+        return is_new, face_id, False
     
     def _maybe_cleanup(self) -> None:
         """Limpia cache si ha pasado suficiente tiempo."""
         now = datetime.now()
-        if (now - self._last_cleanup).total_seconds() > 300:  # 5 minutos
+        if (now - self._last_cleanup).total_seconds() > 300:
             self.cleanup_expired()
             self._last_cleanup = now
     
     def cleanup_expired(self) -> int:
-        """
-        Elimina rostros expirados.
-        
-        Nota: Los rostros en el collage permanecen pero sus metadatos
-        se eliminan. El collage se reconstruye periódicamente.
-        
-        Returns:
-            Número de rostros eliminados
-        """
+        """Elimina rostros expirados (solo pasajeros, no excluidos)."""
         with self._lock:
             expired_ids = [
                 face_id for face_id, face in self._tracked_faces.items()
@@ -398,19 +541,18 @@ class FaceTracker:
             for face_id in expired_ids:
                 del self._tracked_faces[face_id]
             
-            # Si todos los rostros de un collage expiraron, reconstruir
             if expired_ids and len(self._tracked_faces) == 0:
                 self._collages.clear()
                 self._current_collage_faces = 0
-                logger.info("Todos los rostros expiraron, collages limpiados")
+                logger.info("Todos los pasajeros expiraron, collages limpiados")
             
             if expired_ids:
-                logger.info(f"Limpieza: {len(expired_ids)} rostros expirados")
+                logger.info(f"Limpieza: {len(expired_ids)} pasajeros expirados")
             
             return len(expired_ids)
     
     def _evict_oldest(self) -> None:
-        """Elimina el rostro más antiguo."""
+        """Elimina el pasajero más antiguo."""
         if not self._tracked_faces:
             return
         
@@ -420,30 +562,29 @@ class FaceTracker:
         )
         
         del self._tracked_faces[oldest_id]
-        logger.debug(f"Rostro más antiguo eliminado: {oldest_id}")
+        logger.debug(f"Pasajero más antiguo eliminado: {oldest_id}")
     
     def clear(self) -> int:
-        """
-        Limpia todo el cache.
-        
-        Returns:
-            Número de rostros eliminados
-        """
+        """Limpia cache de pasajeros (mantiene excluidos)."""
         with self._lock:
             count = len(self._tracked_faces)
             self._tracked_faces.clear()
             self._collages.clear()
             self._current_collage_faces = 0
-            logger.info(f"Cache limpiado: {count} rostros")
+            logger.info(f"Cache de pasajeros limpiado: {count}")
+            return count
+    
+    def clear_excluded(self) -> int:
+        """Limpia el collage de excluidos."""
+        with self._lock:
+            count = self._excluded_faces_count
+            self._excluded_collage = None
+            self._excluded_faces_count = 0
+            logger.info(f"Excluidos limpiados: {count}")
             return count
     
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Obtiene estadísticas del rastreador.
-        
-        Returns:
-            Diccionario con estadísticas
-        """
+        """Obtiene estadísticas del rastreador."""
         with self._lock:
             active_faces = sum(
                 1 for f in self._tracked_faces.values()
@@ -455,10 +596,12 @@ class FaceTracker:
                 "active_faces": active_faces,
                 "collages": len(self._collages),
                 "faces_in_current_collage": self._current_collage_faces,
+                "excluded_faces": self._excluded_faces_count,
                 "total_comparisons": self._total_comparisons,
                 "total_api_calls": self._total_api_calls,
                 "new_passengers": self._total_new_passengers,
                 "duplicates": self._total_duplicates,
+                "excluded_detected": self._total_excluded_detected,
                 "duplicate_rate": (
                     self._total_duplicates / self._total_comparisons * 100
                     if self._total_comparisons > 0 else 0
@@ -491,26 +634,21 @@ def extract_face_image(
     """
     height, width = frame.shape[:2]
     
-    # Convertir coordenadas normalizadas a píxeles
     left = int(bounding_box['Left'] * width)
     top = int(bounding_box['Top'] * height)
     box_width = int(bounding_box['Width'] * width)
     box_height = int(bounding_box['Height'] * height)
     
-    # Agregar padding
     pad_x = int(box_width * padding)
     pad_y = int(box_height * padding)
     
-    # Calcular coordenadas con padding (clipping a límites)
     x1 = max(0, left - pad_x)
     y1 = max(0, top - pad_y)
     x2 = min(width, left + box_width + pad_x)
     y2 = min(height, top + box_height + pad_y)
     
-    # Recortar rostro
     face_img = frame[y1:y2, x1:x2]
     
-    # Codificar como JPEG
     _, buffer = cv2.imencode('.jpg', face_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return buffer.tobytes()
 
@@ -518,21 +656,16 @@ def extract_face_image(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     
-    print("Probando FaceTracker (collage mode) en dry_run...")
+    print("Probando FaceTracker con excluded_faces...")
     
+    # Test básico en dry_run
     tracker = FaceTracker(dry_run=True, ttl_minutes=5)
     
-    # Simular detección
     fake_face_1 = b"fake_face_image_1"
-    fake_face_2 = b"fake_face_image_2"
-    
-    is_new, face_id = tracker.is_new_passenger(fake_face_1)
-    print(f"Rostro 1: is_new={is_new}, face_id={face_id}")
-    
-    is_new, face_id = tracker.is_new_passenger(fake_face_2)
-    print(f"Rostro 2: is_new={is_new}, face_id={face_id}")
+    is_new, face_id, is_excluded = tracker.is_new_passenger(fake_face_1)
+    print(f"Rostro 1: is_new={is_new}, face_id={face_id}, is_excluded={is_excluded}")
     
     stats = tracker.get_stats()
-    print(f"Stats: {stats}")
+    print(f"Stats: tracked={stats['tracked_faces']}, excluded={stats['excluded_faces']}")
     
     print("\nTest completado")
