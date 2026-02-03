@@ -6,6 +6,8 @@ Este paquete proporciona componentes modulares para:
 - Detección de movimiento (MotionDetector)
 - Almacenamiento local con SQLite (LocalBuffer)
 - Cache de rostros para procesamiento offline (FaceCache)
+- Almacenamiento de eventos de pasajeros (PassengerEventStore)
+- Geolocalización GPS/IP (LocationProvider)
 - Conteo de rostros con AWS Rekognition (FaceCounter)
 - Rastreo de pasajeros para deduplicación (FaceTracker)
 
@@ -15,11 +17,12 @@ Uso típico:
 
 from .camera import VideoStream
 from .motion import MotionDetector
-from .storage import LocalBuffer, FaceCache
+from .storage import LocalBuffer, FaceCache, PassengerEventStore
+from .geolocation import LocationProvider, Location
 from .detector import FaceCounter
 from .tracker import FaceTracker, extract_face_image
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "angelopol"
 
 __all__ = [
@@ -27,8 +30,12 @@ __all__ = [
     "MotionDetector", 
     "LocalBuffer",
     "FaceCache",
+    "PassengerEventStore",
+    "LocationProvider",
+    "Location",
     "FaceCounter",
     "FaceTracker",
     "extract_face_image",
 ]
+
 

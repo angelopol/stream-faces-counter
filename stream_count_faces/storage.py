@@ -799,3 +799,425 @@ class FaceCache:
                 logger.warning(f"FaceCache limpiado: {deleted} registros")
                 return deleted
 
+
+class PassengerEventStore:
+    """
+    Almacenamiento de eventos de abordaje de pasajeros con geolocalización.
+    
+    Guarda timestamp, face_id, y coordenadas GPS para cada pasajero
+    que aborda el vehículo. Permite análisis estadístico de flujo
+    de pasajeros por ubicación (paradas).
+    
+    Las coordenadas son opcionales - si no hay GPS disponible,
+    se almacenan como NULL pero el timestamp siempre se guarda.
+    
+    Ejemplo:
+        >>> store = PassengerEventStore("data/passengers.db")
+        >>> store.record_boarding("abc123", 10.5, -66.9, "gps")
+        >>> stats = store.get_location_stats()
+    """
+    
+    def __init__(self, db_path: str = "data/passenger_events.db"):
+        """
+        Inicializa el almacenamiento de eventos.
+        
+        Args:
+            db_path: Ruta al archivo SQLite
+        """
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._persistent_conn = None
+        
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        else:
+            self._persistent_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._persistent_conn.row_factory = sqlite3.Row
+        
+        self._init_database()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Context manager para conexiones."""
+        if self._persistent_conn is not None:
+            yield self._persistent_conn
+        else:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+    
+    def _init_database(self) -> None:
+        """Inicializa las tablas de la base de datos."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Tabla de eventos de abordaje
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS passenger_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        face_id TEXT,
+                        latitude REAL,
+                        longitude REAL,
+                        location_source TEXT,
+                        location_accuracy REAL,
+                        synced INTEGER DEFAULT 0,
+                        sync_timestamp TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Índices para consultas eficientes
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_passenger_timestamp 
+                    ON passenger_events(timestamp)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_passenger_location 
+                    ON passenger_events(latitude, longitude)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_passenger_synced 
+                    ON passenger_events(synced)
+                """)
+                
+                conn.commit()
+                logger.info(f"PassengerEventStore inicializado: {self.db_path}")
+    
+    def record_boarding(
+        self,
+        face_id: Optional[str] = None,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+        location_source: str = "none",
+        location_accuracy: Optional[float] = None,
+        timestamp: Optional[str] = None
+    ) -> int:
+        """
+        Registra un evento de abordaje de pasajero.
+        
+        Args:
+            face_id: ID del rostro del pasajero (opcional)
+            latitude: Latitud GPS (puede ser None)
+            longitude: Longitud GPS (puede ser None)
+            location_source: Fuente de ubicación ('gps', 'serial', 'ip', 'none')
+            location_accuracy: Precisión en metros (opcional)
+            timestamp: Timestamp ISO 8601 (default: ahora)
+            
+        Returns:
+            ID del evento registrado
+        """
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO passenger_events 
+                    (timestamp, face_id, latitude, longitude, location_source, location_accuracy)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (timestamp, face_id, latitude, longitude, location_source, location_accuracy)
+                )
+                conn.commit()
+                event_id = cursor.lastrowid
+                
+                logger.debug(
+                    f"Abordaje registrado: id={event_id}, "
+                    f"face={face_id[:8] if face_id else 'N/A'}, "
+                    f"loc={f'{latitude:.4f},{longitude:.4f}' if latitude else 'None'}, "
+                    f"source={location_source}"
+                )
+                return event_id
+    
+    def get_recent_events(
+        self, 
+        limit: int = 100,
+        hours: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtiene eventos de abordaje recientes.
+        
+        Args:
+            limit: Número máximo de eventos
+            hours: Filtrar por últimas N horas (opcional)
+            
+        Returns:
+            Lista de eventos de abordaje
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if hours:
+                    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                    cursor.execute(
+                        """
+                        SELECT * FROM passenger_events
+                        WHERE timestamp >= ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                        """,
+                        (cutoff, limit)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT * FROM passenger_events
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                        """,
+                        (limit,)
+                    )
+                
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+    
+    def get_pending_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Obtiene eventos pendientes de sincronizar."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM passenger_events
+                    WHERE synced = 0
+                    ORDER BY timestamp ASC
+                    LIMIT ?
+                    """,
+                    (limit,)
+                )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+    
+    def mark_synced(self, event_ids: List[int]) -> int:
+        """Marca eventos como sincronizados."""
+        if not event_ids:
+            return 0
+        
+        sync_timestamp = datetime.now().isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ",".join("?" * len(event_ids))
+                cursor.execute(
+                    f"""
+                    UPDATE passenger_events
+                    SET synced = 1, sync_timestamp = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [sync_timestamp] + event_ids
+                )
+                conn.commit()
+                return cursor.rowcount
+    
+    def get_location_stats(
+        self, 
+        precision: int = 3,
+        hours: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtiene estadísticas de pasajeros agrupadas por ubicación.
+        
+        Agrupa eventos cercanos (mismo redondeo de coordenadas)
+        para identificar "paradas" aproximadas.
+        
+        Args:
+            precision: Decimales para agrupar (3 = ~100m)
+            hours: Filtrar por últimas N horas
+            
+        Returns:
+            Lista de ubicaciones con conteo de pasajeros
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Usar ROUND para agrupar ubicaciones cercanas
+                if hours:
+                    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                    cursor.execute(
+                        f"""
+                        SELECT 
+                            ROUND(latitude, {precision}) as lat_group,
+                            ROUND(longitude, {precision}) as lng_group,
+                            COUNT(*) as passenger_count,
+                            MIN(timestamp) as first_boarding,
+                            MAX(timestamp) as last_boarding
+                        FROM passenger_events
+                        WHERE latitude IS NOT NULL 
+                          AND longitude IS NOT NULL
+                          AND timestamp >= ?
+                        GROUP BY lat_group, lng_group
+                        ORDER BY passenger_count DESC
+                        """,
+                        (cutoff,)
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT 
+                            ROUND(latitude, {precision}) as lat_group,
+                            ROUND(longitude, {precision}) as lng_group,
+                            COUNT(*) as passenger_count,
+                            MIN(timestamp) as first_boarding,
+                            MAX(timestamp) as last_boarding
+                        FROM passenger_events
+                        WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+                        GROUP BY lat_group, lng_group
+                        ORDER BY passenger_count DESC
+                        """
+                    )
+                
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "latitude": row["lat_group"],
+                        "longitude": row["lng_group"],
+                        "passenger_count": row["passenger_count"],
+                        "first_boarding": row["first_boarding"],
+                        "last_boarding": row["last_boarding"]
+                    }
+                    for row in rows
+                ]
+    
+    def get_hourly_stats(self, days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Obtiene estadísticas de pasajeros por hora del día.
+        
+        Útil para identificar horas pico.
+        
+        Args:
+            days: Días hacia atrás a considerar
+            
+        Returns:
+            Lista con conteo por hora (0-23)
+        """
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT 
+                        CAST(strftime('%H', timestamp) AS INTEGER) as hour,
+                        COUNT(*) as passenger_count
+                    FROM passenger_events
+                    WHERE timestamp >= ?
+                    GROUP BY hour
+                    ORDER BY hour
+                    """,
+                    (cutoff,)
+                )
+                
+                rows = cursor.fetchall()
+                # Completar horas faltantes con 0
+                hourly = {row["hour"]: row["passenger_count"] for row in rows}
+                return [
+                    {"hour": h, "passenger_count": hourly.get(h, 0)}
+                    for h in range(24)
+                ]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtiene estadísticas generales."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Total de eventos
+                cursor.execute("SELECT COUNT(*) as total FROM passenger_events")
+                total = cursor.fetchone()["total"]
+                
+                # Eventos con ubicación
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) as with_location 
+                    FROM passenger_events 
+                    WHERE latitude IS NOT NULL
+                    """
+                )
+                with_location = cursor.fetchone()["with_location"]
+                
+                # Por fuente de ubicación
+                cursor.execute(
+                    """
+                    SELECT location_source, COUNT(*) as count
+                    FROM passenger_events
+                    GROUP BY location_source
+                    """
+                )
+                by_source = {row["location_source"]: row["count"] for row in cursor.fetchall()}
+                
+                # Pendientes de sincronizar
+                cursor.execute(
+                    "SELECT COUNT(*) as pending FROM passenger_events WHERE synced = 0"
+                )
+                pending = cursor.fetchone()["pending"]
+                
+                # Evento más reciente
+                cursor.execute(
+                    "SELECT timestamp FROM passenger_events ORDER BY timestamp DESC LIMIT 1"
+                )
+                latest_row = cursor.fetchone()
+                latest = latest_row["timestamp"] if latest_row else None
+                
+                return {
+                    "total_events": total,
+                    "events_with_location": with_location,
+                    "events_without_location": total - with_location,
+                    "location_rate": round(with_location / total * 100, 1) if total > 0 else 0,
+                    "by_source": by_source,
+                    "pending_sync": pending,
+                    "latest_event": latest,
+                    "db_path": self.db_path
+                }
+    
+    def cleanup_old_events(self, days: int = 90) -> int:
+        """
+        Elimina eventos antiguos sincronizados.
+        
+        Args:
+            days: Días a mantener
+            
+        Returns:
+            Número de eventos eliminados
+        """
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM passenger_events
+                    WHERE synced = 1 AND timestamp < ?
+                    """,
+                    (cutoff,)
+                )
+                conn.commit()
+                deleted = cursor.rowcount
+                
+                if deleted > 0:
+                    logger.info(f"Eventos de pasajeros antiguos eliminados: {deleted}")
+                return deleted
+    
+    def clear_all(self) -> int:
+        """Elimina todos los eventos."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM passenger_events")
+                conn.commit()
+                deleted = cursor.rowcount
+                logger.warning(f"PassengerEventStore limpiado: {deleted} eventos")
+                return deleted
+
+
