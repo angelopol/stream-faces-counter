@@ -10,6 +10,7 @@ Este paquete proporciona componentes modulares para:
 - Geolocalización GPS/IP (LocationProvider)
 - Conteo de rostros con AWS Rekognition (FaceCounter)
 - Rastreo de pasajeros para deduplicación (FaceTracker)
+- Sincronización con servidor admin (CloudSync)
 
 Uso típico:
     from stream_count_faces import VideoStream, MotionDetector, LocalBuffer, FaceCounter, FaceTracker
@@ -21,8 +22,9 @@ from .storage import LocalBuffer, FaceCache, PassengerEventStore
 from .geolocation import LocationProvider, Location
 from .detector import FaceCounter
 from .tracker import FaceTracker, extract_face_image
+from .sync import CloudSync, SyncManager, SyncResult, get_device_mac
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __author__ = "angelopol"
 
 __all__ = [
@@ -36,6 +38,8 @@ __all__ = [
     "FaceCounter",
     "FaceTracker",
     "extract_face_image",
+    "CloudSync",
+    "SyncManager",
+    "SyncResult",
+    "get_device_mac",
 ]
-
-
