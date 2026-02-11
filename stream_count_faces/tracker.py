@@ -264,6 +264,21 @@ class FaceTracker:
             if resized.shape[0] != self._excluded_collage.shape[0]:
                 resized = cv2.resize(resized, (self.FACE_SIZE[0], self._excluded_collage.shape[0]))
             self._excluded_collage = np.hstack([self._excluded_collage, resized])
+        
+        # DEBUG: Save excluded collage
+        if logger.isEnabledFor(logging.DEBUG):
+            self._save_excluded_collage_debug()
+
+    def _save_excluded_collage_debug(self) -> None:
+        """Guarda el collage de excluidos en disco para debug."""
+        try:
+            if self._excluded_collage is not None:
+                debug_dir = Path("data/debug_faces")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(debug_dir / "excluded_collage.jpg"), self._excluded_collage)
+                logger.debug("Saved excluded collage to data/debug_faces/excluded_collage.jpg")
+        except Exception as e:
+            logger.warning(f"Failed to save excluded collage: {e}")
     
     def add_excluded_face(self, face: Union[str, bytes, np.ndarray]) -> bool:
         """
