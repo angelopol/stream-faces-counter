@@ -154,10 +154,16 @@ class FaceTracker:
         
         # Cache offline (cuando AWS no está disponible)
         self._offline_cache = None
+        self._persistence = None
+        
         if offline_cache_path:
-            from .storage import FaceCache
+            from .storage import FaceCache, TrackerPersistence
             self._offline_cache = FaceCache(offline_cache_path)
-            logger.info(f"Offline cache habilitado: {offline_cache_path}")
+            self._persistence = TrackerPersistence(offline_cache_path)
+            logger.info(f"Offline cache y persistencia habilitados: {offline_cache_path}")
+            
+            # Cargar estado previo
+            self.load_state()
         
         # Cargar rostros excluidos
         if excluded_faces:
@@ -797,6 +803,96 @@ class FaceTracker:
                 stats["offline_cache"] = self._offline_cache.get_stats()
             
             return stats
+
+    def save_state(self) -> None:
+        """Guarda el estado actual en persistencia."""
+        if not self._persistence:
+            return
+            
+        try:
+            with self._lock:
+                # Convertir collages a bytes
+                collages_data = []
+                for collage in self._collages:
+                    success, buffer = cv2.imencode('.jpg', collage)
+                    if success:
+                        collages_data.append(buffer.tobytes())
+                
+                # Convertir rostros rastreados
+                faces_data = []
+                for face in self._tracked_faces.values():
+                    faces_data.append({
+                        'face_id': face.face_id,
+                        'first_seen': face.first_seen.isoformat(),
+                        'last_seen': face.last_seen.isoformat(),
+                        'collage_idx': face.position_in_collage
+                    })
+                    
+                self._persistence.save_state(collages_data, faces_data)
+                logger.info("Estado de tracking guardado en disco")
+        except Exception as e:
+            logger.error(f"Error guardando estado: {e}")
+
+    def load_state(self) -> None:
+        """Carga el estado desde persistencia."""
+        if not self._persistence:
+            return
+            
+        try:
+            collages_dict, faces_list = self._persistence.load_state()
+            
+            with self._lock:
+                # Restaurar collages
+                self._collages.clear()
+                max_idx = -1
+                if collages_dict:
+                    max_idx = max(collages_dict.keys())
+                
+                # Reconstruir lista de collages preservando orden
+                for i in range(max_idx + 1):
+                    if i in collages_dict:
+                        nparr = np.frombuffer(collages_dict[i], np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        self._collages.append(img)
+                    else:
+                        # Si falta un índice intermedio (raro), no podemos hacer mucho
+                        # Podríamos insertar una imagen negra o saltar
+                        logger.warning(f"Índice de collage faltante: {i}")
+                
+                # Restaurar rostros
+                self._tracked_faces.clear()
+                loaded_faces = 0
+                for f in faces_list:
+                    try:
+                        face = TrackedFace(
+                            face_id=f['face_id'],
+                            first_seen=datetime.fromisoformat(f['first_seen']),
+                            last_seen=datetime.fromisoformat(f['last_seen']),
+                            position_in_collage=f['collage_idx']
+                        )
+                        
+                        # Validar que el índice de collage sea válido
+                        if 0 <= face.position_in_collage < len(self._collages):
+                            self._tracked_faces[face.face_id] = face
+                            loaded_faces += 1
+                    except Exception as e:
+                        logger.warning(f"Error restaurando rostro {f.get('face_id')}: {e}")
+                
+                # Resetear contador para forzar nuevo collage si el último está lleno
+                # O mejor, intentar recalcular si el último tiene espacio
+                # Por simplicidad, asumimos que el último está "lleno" o "casi lleno"
+                # y dejamos que el sistema gestione la creación de uno nuevo si es necesario
+                if self._collages:
+                    # Contar rostros en el último collage
+                    last_idx = len(self._collages) - 1
+                    faces_in_last = sum(1 for f in self._tracked_faces.values() if f.position_in_collage == last_idx)
+                    self._current_collage_faces = faces_in_last
+                else:
+                    self._current_collage_faces = 0
+                    
+                logger.info(f"Estado restaurado: {len(self._collages)} collages, {loaded_faces} rostros activos")
+        except Exception as e:
+            logger.error(f"Error cargando estado: {e}")
 
 
 def extract_face_image(

@@ -107,6 +107,12 @@ class MotionDetector:
             logger.debug("Frame de referencia establecido")
             return False
         
+        # Verificar si las dimensiones coinciden
+        if processed.shape != self._reference_frame.shape:
+            logger.warning(f"Cambio de resolución detectado: {self._reference_frame.shape} -> {processed.shape}. Reiniciando referencia.")
+            self._reference_frame = processed
+            return False
+        
         # Si estamos en cooldown, mantener el estado de movimiento
         if self._cooldown_counter > 0:
             self._cooldown_counter -= 1

@@ -800,6 +800,130 @@ class FaceCache:
                 return deleted
 
 
+class TrackerPersistence:
+    """
+    Persistencia del estado del FaceTracker (collages y rostros activos).
+    Permite recuperar el estado después de un reinicio.
+    """
+    
+    def __init__(self, db_path: str = "data/face_cache.db"):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            
+        self._init_database()
+        
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path)
+        
+    def _init_database(self) -> None:
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Tabla de collages
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tracker_collages (
+                        idx INTEGER PRIMARY KEY,
+                        image_data BLOB NOT NULL,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Tabla de rostros rastreados
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tracker_faces (
+                        face_id TEXT PRIMARY KEY,
+                        first_seen TEXT NOT NULL,
+                        last_seen TEXT NOT NULL,
+                        collage_idx INTEGER,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                conn.commit()
+                logger.info(f"TrackerPersistence inicializado: {self.db_path}")
+
+    def save_state(self, collages: List[bytes], faces: List[Dict[str, Any]]) -> None:
+        """
+        Guarda el estado completo (sobrescribe lo anterior).
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Limpiar todo
+                cursor.execute("DELETE FROM tracker_collages")
+                cursor.execute("DELETE FROM tracker_faces")
+                
+                # Guardar collages
+                for idx, img_data in enumerate(collages):
+                    cursor.execute(
+                        "INSERT INTO tracker_collages (idx, image_data) VALUES (?, ?)",
+                        (idx, img_data)
+                    )
+                
+                # Guardar rostros
+                for face in faces:
+                    cursor.execute(
+                        """
+                        INSERT INTO tracker_faces (face_id, first_seen, last_seen, collage_idx)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            face['face_id'], 
+                            face['first_seen'], 
+                            face['last_seen'], 
+                            face['collage_idx']
+                        )
+                    )
+                
+                conn.commit()
+                logger.info(f"Estado del tracker guardado: {len(collages)} collages, {len(faces)} rostros")
+
+    def load_state(self) -> Tuple[Dict[int, bytes], List[Dict[str, Any]]]:
+        """
+        Carga el estado guardado.
+        
+        Returns:
+            (collages_dict, faces_list)
+        """
+        collages = {}
+        faces = []
+        
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Cargar collages
+                cursor.execute("SELECT idx, image_data FROM tracker_collages ORDER BY idx ASC")
+                for row in cursor.fetchall():
+                    collages[row[0]] = row[1]
+                
+                # Cargar rostros
+                cursor.execute("SELECT face_id, first_seen, last_seen, collage_idx FROM tracker_faces")
+                for row in cursor.fetchall():
+                    faces.append({
+                        'face_id': row[0],
+                        'first_seen': row[1],
+                        'last_seen': row[2],
+                        'collage_idx': row[3]
+                    })
+                    
+        return collages, faces
+        
+    def clear(self):
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM tracker_collages")
+                cursor.execute("DELETE FROM tracker_faces")
+                conn.commit()
+
+
+
 class PassengerEventStore:
     """
     Almacenamiento de eventos de abordaje de pasajeros con geolocalización.
