@@ -9,6 +9,10 @@ import os
 import cv2
 import boto3
 import logging
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -96,6 +100,7 @@ class FaceCounter:
         face_occluded_threshold: float = 80.0,
         frontal_threshold: float = 35.0,
         dry_run: bool = False,
+        engine: str = "aws",
         region: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
@@ -109,15 +114,17 @@ class FaceCounter:
             face_occluded_threshold: Umbral de oclusión (0-100)
             frontal_threshold: Ángulo máximo para frontalidad
             dry_run: Si True, no hace llamadas reales a AWS
+            engine: Motor de detección ("aws" o "local")
             region: Región de AWS para Rekognition (default: env o us-east-1)
-            aws_access_key_id: AWS Access Key ID (opcional, usa env si no se provee)
-            aws_secret_access_key: AWS Secret Access Key (opcional, usa env si no se provee)
-            aws_session_token: AWS Session Token para credenciales temporales (opcional)
+            aws_access_key_id: AWS Access Key ID (opcional)
+            aws_secret_access_key: AWS Secret Access Key (opcional)
+            aws_session_token: AWS Session Token para credenciales temporales
         """
         self.face_confidence_threshold = face_confidence_threshold
         self.face_occluded_threshold = face_occluded_threshold
         self.frontal_threshold = frontal_threshold
         self.dry_run = dry_run
+        self.engine = engine
         
         # AWS Configuration - parameters override environment variables
         self.region = region or os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
@@ -130,7 +137,19 @@ class FaceCounter:
         self._total_frames_processed = 0
         self._last_error: Optional[str] = None
         
-        if not dry_run:
+        if self.engine == "local":
+            model_path = os.path.join(os.path.dirname(__file__), "blaze_face_short_range.tflite")
+            if not os.path.exists(model_path):
+                logger.warning(f"Model file {model_path} not found. Ensure it is downloaded.")
+            
+            base_options = mp_python.BaseOptions(model_asset_path=model_path)
+            options = mp_vision.FaceDetectorOptions(
+                base_options=base_options,
+                min_detection_confidence=self.face_confidence_threshold / 100.0
+            )
+            self._face_detector = mp_vision.FaceDetector.create_from_options(options)
+            logger.info("Motor de detección local (Mediapipe Tasks) inicializado")
+        elif not dry_run:
             self._init_client()
     
     def _init_client(self) -> bool:
@@ -228,6 +247,9 @@ class FaceCounter:
         
         if self.dry_run:
             return self._simulate_detection(frame)
+            
+        if self.engine == "local":
+            return self._local_detect(frame)
         
         if self._client is None:
             if not self._init_client():
@@ -293,7 +315,75 @@ class FaceCounter:
             self._last_error = str(e)
             return []
         except Exception as e:
-            logger.error(f"Error en detección de rostros: {e}")
+            logger.error(f"Error en detección de rostros (AWS): {e}")
+            self._last_error = str(e)
+            return []
+            
+    def _local_detect(self, frame) -> List[DetectedFace]:
+        """
+        Detecta y extrae metadata de rostros usando Mediapipe (procesamiento local).
+        No retorna error en caso de fallo, retorna lista vacía.
+        """
+        try:
+            # Convertir a RGB para Mediapipe y crear mp.Image
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
+            # Detectar caras
+            detection_result = self._face_detector.detect(mp_image)
+            
+            faces = []
+            if detection_result.detections:
+                height, width = frame.shape[:2]
+                for detection in detection_result.detections:
+                    confidence = detection.categories[0].score * 100.0
+                    if confidence < self.face_confidence_threshold:
+                        continue
+                        
+                    bbox = detection.bounding_box
+                    # Convert to normalized rekognition format
+                    bounding_box = {
+                        'Left': max(0.0, bbox.origin_x / width),
+                        'Top': max(0.0, bbox.origin_y / height),
+                        'Width': min(1.0 - (bbox.origin_x / width), bbox.width / width),
+                        'Height': min(1.0 - (bbox.origin_y / height), bbox.height / height)
+                    }
+                    
+                    # Calcular calidad (Sharpness & Brightness)
+                    x_px = int(bounding_box['Left'] * width)
+                    y_px = int(bounding_box['Top'] * height)
+                    w_px = int(bounding_box['Width'] * width)
+                    h_px = int(bounding_box['Height'] * height)
+                    
+                    x_px = max(0, min(x_px, width - 1))
+                    y_px = max(0, min(y_px, height - 1))
+                    w_px = max(1, min(w_px, width - x_px))
+                    h_px = max(1, min(h_px, height - y_px))
+                    
+                    roi = frame[y_px:y_px+h_px, x_px:x_px+w_px]
+                    sharpness = 0
+                    brightness = 0
+                    if roi.size > 0:
+                        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        sharpness = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
+                        brightness = np.mean(gray_roi)
+                    
+                    detected_face = DetectedFace(
+                        confidence=confidence,
+                        bounding_box=bounding_box,
+                        pose={'Yaw': 0, 'Roll': 0, 'Pitch': 0},
+                        is_frontal=True,  # Asumimos que si MP lo detecta, es suficientemente frontal
+                        is_occluded=False,
+                        quality={'brightness': float(brightness), 'sharpness': float(sharpness)}
+                    )
+                    faces.append(detected_face)
+                    
+            self._total_faces_detected += len(faces)
+            if faces:
+                logger.debug(f"Rostros detectados (local): {len(faces)}")
+            return faces
+        except Exception as e:
+            logger.error(f"Error en detección local mediapipe: {e}")
             self._last_error = str(e)
             return []
     
@@ -417,26 +507,22 @@ if __name__ == "__main__":
     
     logging.basicConfig(level=logging.DEBUG)
     
-    print("Probando FaceCounter en modo dry_run...")
-    counter = FaceCounter(dry_run=True)
-    
-    # Crear frame de prueba (negro)
+    # Create test frame (black)
     test_frame = np.zeros((480, 640, 3), dtype=np.uint8)
     
-    # Detectar rostros (debería encontrar 0 en frame negro)
-    faces = counter.count_faces(test_frame)
-    print(f"Rostros en frame negro: {len(faces)}")
+    print("\nProbando FaceCounter en modo local (Mediapipe Tasks Vision)...")
+    counter_local = FaceCounter(engine="local")
+    faces_local = counter_local.count_faces(test_frame)
+    print(f"Rostros en frame negro (local): {len(faces_local)}")
     
-    # Estadísticas
-    stats = counter.get_stats()
-    print(f"Estadísticas: {stats}")
+    # Stats
     
     print("\nPara probar con una cámara real, ejecute:")
     print("  python -c \"")
     print("  import cv2")
     print("  from detector import FaceCounter")
     print("  cap = cv2.VideoCapture(0)")
-    print("  counter = FaceCounter(dry_run=True)")
+    print("  counter = FaceCounter(engine='local')")
     print("  ret, frame = cap.read()")
     print("  if ret:")
     print("      faces = counter.count_faces(frame)")
