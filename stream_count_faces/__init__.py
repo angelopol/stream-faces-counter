@@ -24,6 +24,12 @@ from .detector import FaceCounter
 from .tracker import FaceTracker, extract_face_image
 from .sync import CloudSync, SyncManager, SyncResult, get_device_mac
 
+import logging
+# Disable excessive external library debug logs globally for this package
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('s3transfer').setLevel(logging.WARNING)
+
 __version__ = "1.4.0"
 __author__ = "angelopol"
 
